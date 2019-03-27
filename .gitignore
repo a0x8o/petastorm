@@ -1,0 +1,11 @@
+*.pyc
+.idea
+.pytest_cache
+
+# Repository build artifacts
+petastorm.egg-info
+build
+dist
+
+# Sphinx autodoc build directory
+_build
