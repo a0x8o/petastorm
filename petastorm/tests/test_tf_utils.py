@@ -21,7 +21,6 @@ from decimal import Decimal
 
 import numpy as np
 import pytest
-import six
 import tensorflow as tf
 
 from petastorm import make_reader, make_batch_reader, TransformSpec
@@ -32,7 +31,7 @@ from petastorm.tf_utils import _sanitize_field_tf_types, _numpy_to_tf_dtypes, \
 from petastorm.unischema import Unischema, UnischemaField
 
 NON_NULLABLE_FIELDS = set(TestSchema.fields.values()) - \
-                      {TestSchema.matrix_nullable, TestSchema.string_array_nullable}
+                      {TestSchema.matrix_nullable, TestSchema.string_array_nullable, TestSchema.integer_nullable}
 
 
 @contextmanager
@@ -296,8 +295,6 @@ def test_simple_read_tensorflow_with_parquet_dataset(scalar_dataset):
 
 
 @pytest.mark.forked
-@pytest.mark.skipif(six.PY3, reason='Python 3 does not support namedtuples with > 255 number of fields. '
-                                    'https://github.com/uber/petastorm/pull/323 will address this issue')
 def test_simple_read_tensorflow_with_non_petastorm_many_columns_dataset(many_columns_non_petastorm_dataset):
     """Read couple of rows. Make sure all tensors have static shape sizes assigned and the data matches reference
     data"""

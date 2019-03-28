@@ -18,7 +18,6 @@ from copy import copy
 
 import numpy as np
 import pytest
-import six
 import tensorflow as tf
 
 from petastorm import make_reader, make_batch_reader
@@ -28,7 +27,8 @@ from petastorm.tests.test_common import TestSchema
 from petastorm.tf_utils import make_petastorm_dataset
 
 _EXCLUDE_FIELDS = set(TestSchema.fields.values()) \
-                  - {TestSchema.matrix_nullable, TestSchema.string_array_nullable, TestSchema.decimal}
+                  - {TestSchema.matrix_nullable, TestSchema.string_array_nullable, TestSchema.decimal,
+                     TestSchema.integer_nullable}
 
 MINIMAL_READER_FLAVOR_FACTORIES = [
     lambda url, **kwargs: make_reader(url, **_merge_params({'reader_pool_type': 'dummy',
@@ -154,8 +154,6 @@ def test_dataset_on_ngram_not_supported(synthetic_dataset, reader_factory):
 
 
 @pytest.mark.forked
-@pytest.mark.skipif(six.PY3, reason='Python 3 does not support namedtuples with > 255 number of fields. '
-                                    'https://github.com/uber/petastorm/pull/323 will address this issue')
 def test_non_petastorm_with_many_colums_with_one_shot_iterator(many_columns_non_petastorm_dataset):
     """Just a bunch of read and compares of all values to the expected values"""
     with make_batch_reader(many_columns_non_petastorm_dataset.url, workers_count=1) as reader:
