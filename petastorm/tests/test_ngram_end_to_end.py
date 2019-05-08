@@ -539,3 +539,88 @@ def test_ngram_shuffle_drop_ratio(synthetic_dataset, reader_factory):
         shuffled = [row[0].id for row in reader]
     assert len(unshuffled) == len(shuffled)
     assert unshuffled != shuffled
+
+
+def _test_continuous_ngram_returns(ngram_fields, ts_field, dataset_num_files_1, reader_factory):
+    """Test continuous ngram of a certain length. Continuous here refers to
+    that this reader will always return consecutive ngrams due to shuffle being false
+    and partition being 1. Returns the ngram object"""
+
+    ngram = NGram(fields=ngram_fields, delta_threshold=10, timestamp_field=ts_field)
+    with reader_factory(dataset_num_files_1.url, schema_fields=ngram, shuffle_row_groups=False) as reader:
+        expected_id = 0
+
+        for _ in range(ngram.length):
+            actual = next(reader)
+            expected_ngram = _get_named_tuple_from_ngram(ngram, dataset_num_files_1.data, expected_id)
+            np.testing.assert_equal(actual, expected_ngram)
+            expected_id = expected_id + 1
+
+    return ngram
+
+
+@pytest.mark.parametrize('reader_factory', READER_FACTORIES)
+def test_ngram_with_regex_fields(dataset_num_files_1, reader_factory):
+    """Tests to verify fields and timestamp field can be regular expressions and work with a reader
+    """
+    fields = {
+        -1: ["^id.*$", "sensor_name", TestSchema.partition_key],
+        0: ["^id.*$", "sensor_name", TestSchema.partition_key],
+        1: ["^id.*$", "sensor_name", TestSchema.partition_key]
+    }
+
+    ts_field = '^id$'
+
+    expected_fields = [TestSchema.id, TestSchema.id2, TestSchema.id_float, TestSchema.id_odd,
+                       TestSchema.sensor_name, TestSchema.partition_key]
+
+    ngram = _test_continuous_ngram_returns(fields, ts_field, dataset_num_files_1, reader_factory)
+
+    # fields should get resolved after call to a reader
+    ngram_fields = ngram.fields
+
+    # Can't do direct set equality between expected fields and ngram.fields b/c of issue
+    # with `Collections.UnischemaField` (see unischema.py for more information). __hash__
+    # and __eq__ is implemented correctly for UnischemaField. However, a collections.UnischemaField
+    # object will not use the __hash__ definied in `petastorm.unischema.py`
+    for k in ngram_fields.keys():
+        assert len(expected_fields) == len(ngram_fields[k])
+
+        for curr_field in expected_fields:
+            assert curr_field in ngram_fields[k]
+
+    assert TestSchema.id == ngram._timestamp_field
+
+
+@pytest.mark.parametrize('reader_factory', READER_FACTORIES)
+def test_ngram_regex_field_resolve(dataset_num_files_1, reader_factory):
+    """Tests ngram.resolve_regex_field_names function
+    """
+    fields = {
+        -1: ["^id.*", "sensor_name", TestSchema.partition_key],
+        0: ["^id.*", "sensor_name", TestSchema.partition_key],
+        1: ["^id.*", "sensor_name", TestSchema.partition_key]
+    }
+
+    ts_field = '^id$'
+
+    ngram = NGram(fields=fields, delta_threshold=10, timestamp_field=ts_field)
+
+    expected_fields = {TestSchema.id, TestSchema.id2, TestSchema.id_float, TestSchema.id_odd,
+                       TestSchema.sensor_name, TestSchema.partition_key}
+
+    ngram.resolve_regex_field_names(TestSchema)
+
+    ngram_fields = ngram.fields
+
+    # Can't do direct set equality between expected fields and ngram.fields b/c of issue
+    # with `Collections.UnischemaField` (see unischema.py for more information). __hash__
+    # and __eq__ is implemented correctly for UnischemaField. However, a collections.UnischemaField
+    # object will not use the __hash__ definied in `petastorm.unischema.py`
+    for k in ngram_fields.keys():
+        assert len(expected_fields) == len(ngram_fields[k])
+
+        for curr_field in expected_fields:
+            assert curr_field in ngram_fields[k]
+
+    assert TestSchema.id == ngram._timestamp_field

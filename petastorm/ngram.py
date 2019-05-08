@@ -13,7 +13,8 @@
 # limitations under the License.
 import numbers
 
-from petastorm.unischema import UnischemaField
+from petastorm.unischema import UnischemaField, match_unischema_fields
+from six import string_types
 
 
 class NGram(object):
@@ -116,10 +117,12 @@ class NGram(object):
         """
         self._fields = fields
         self._delta_threshold = delta_threshold
+
         self._timestamp_field = timestamp_field
+
         self.timestamp_overlap = timestamp_overlap
 
-        self._validate_ngram(fields, delta_threshold, timestamp_field)
+        self._validate_ngram(fields, delta_threshold, timestamp_field, timestamp_overlap)
 
     @property
     def length(self):
@@ -145,30 +148,32 @@ class NGram(object):
         """
         return self._delta_threshold
 
-    def _validate_ngram(self, fields, delta_threshold, timestamp_field):
+    def _validate_ngram(self, fields, delta_threshold, timestamp_field, timestamp_overlap):
         """
         Validates the fields, delta_threshold and timestamp_field are set and of the correct types.
         :param fields: The ngram fields.
         :param delta_threshold: The delta threshold.
         :param timestamp_field: The timestamp field.
+        :param timestamp_overlap: Whether timestamps in sequences are allowed to overlap
         """
         if fields is None or not isinstance(fields, dict):
             raise ValueError('Fields must be set and must be a dictionary.')
 
         for key in fields:
             if not isinstance(fields[key], list):
-                raise ValueError('Each field value must be a list of unischema fields')
+                raise ValueError('Each field value must be a list of unischema fields/regular expression(s)')
             for field in fields[key]:
-                if not isinstance(field, UnischemaField):
-                    raise ValueError('All field values must be of type UnischemaField.')
+                if not (isinstance(field, UnischemaField) or isinstance(field, string_types)):
+                    raise ValueError('All field values must be of type UnischemaField/regular expression')
 
         if delta_threshold is None or not isinstance(delta_threshold, numbers.Number):
             raise ValueError('delta_threshold must be a number.')
 
-        if timestamp_field is None or not isinstance(timestamp_field, UnischemaField):
-            raise ValueError('timestamp_field must be set and must be of type UnischemaField.')
+        if timestamp_field is None or not (isinstance(timestamp_field, UnischemaField) or
+                                           isinstance(timestamp_field, string_types)):
+            raise ValueError('timestamp_field must be set and must be of type UnischemaField or regular expression')
 
-        if self.timestamp_overlap is None or not isinstance(self.timestamp_overlap, bool):
+        if timestamp_overlap is None or not isinstance(timestamp_overlap, bool):
             raise ValueError('timestamp_overlap must be set and must be of type bool')
 
     def _ngram_pass_threshold(self, ngram):
@@ -186,6 +191,16 @@ class NGram(object):
             if current[self._timestamp_field.name] - previous[self._timestamp_field.name] > self.delta_threshold:
                 return False
         return True
+
+    def resolve_regex_field_names(self, schema):
+        """Resolve string(s) (regular expression(s)) that were passed into 'fields' and 'timestamp_field' parameters
+        """
+        self._fields = {k: self.convert_fields(schema, self._fields[k]) for k in self._fields.keys()}
+        converted_ts_field = self.convert_fields(schema, [self._timestamp_field])
+        if len(converted_ts_field) > 1:
+            raise ValueError("timestamp_field was matched to more than one unischema field")
+
+        self._timestamp_field = converted_ts_field[0]
 
     def get_field_names_at_timestep(self, timestep):
         """
@@ -284,3 +299,28 @@ class NGram(object):
     def get_field_names_at_all_timesteps(self):
         """Returns a list of fields that are present at least in the one of the time offsets"""
         return list({field for fields in self._fields.values() for field in fields})
+
+    def convert_fields(self, unischema, field_list):
+        """Convert all the fields in field_list into Unischema fields.
+        field_list can contain unischema fields and strings (regular expressions)
+
+        :param unischema: Unischema object
+        :param field_list: A list of unischema fields or strings (regular expressions)
+        :return: list of unischema fields
+        """
+        # Split fields parameter to regex pattern strings and UnischemaField objects
+        regex_patterns = [f for f in field_list if isinstance(f, string_types)]
+        # We can not check type against UnischemaField because the artifact introduced by
+        # pickling, since depickled UnischemaField are of type collections.UnischemaField
+        # while withing depickling they are of petastorm.unischema.UnischemaField
+        # Since UnischemaField is a tuple, we check against it since it is invariant to
+        # pickling
+        unischema_field_objects = [f for f in field_list if isinstance(f, tuple)]
+
+        if len(unischema_field_objects) + len(regex_patterns) != len(field_list):
+            raise ValueError('"Elements of fields"/"timestamp field" must be either a string (regular expressions) or'
+                             ' an instance of UnischemaField class.')
+
+        converted_fields = unischema_field_objects + match_unischema_fields(unischema, regex_patterns)
+
+        return converted_fields
