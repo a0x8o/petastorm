@@ -16,7 +16,7 @@ from petastorm.unischema import UnischemaField, Unischema
 
 
 class TransformSpec(object):
-    def __init__(self, func, edit_fields=None, removed_fields=None):
+    def __init__(self, func=None, edit_fields=None, removed_fields=None):
         """TransformSpec defines a user transformation that is applied to a loaded row on a worker thread/process.
 
         The object defines the function (callable) that perform the transform as well as the
@@ -26,11 +26,13 @@ class TransformSpec(object):
         ``edit_fields`` and ``removed_fields`` define mutating operations performed on the original schema that
         produce a post-transform schema. ``func`` return value must comply to this post-transform schema.
 
-        :param func: A callable. The function is called on the worker thread. It takes a dictionary that complies to
-          the input schema and must return a dictionary that complies to a post-transform schema.
+        :param func: Optional. A callable. The function is called on the worker thread. It takes a dictionary that
+          complies to the input schema and must return a dictionary that complies to a post-transform schema. User may
+          In case the user wants to only remove certain fields, the user may omit this argument and specify only
+          `remove_fields` argument.
         :param edit_fields: Optional. A list of 4-tuples with the following fields:
           ``(name, numpy_dtype, shape, is_nullable)``
-        :param removed_fields: Optional. A list of field names that will be removed from the original schema.
+        :param removed_fields: Optional[list]. A list of field names that will be removed from the original schema.
         """
         self.func = func
         self.edit_fields = edit_fields or []
@@ -47,9 +49,9 @@ def transform_schema(schema, transform_spec):
     removed_fields = set(transform_spec.removed_fields)
     unknown_field_names = removed_fields - set(schema.fields.keys())
     if unknown_field_names:
-        raise ValueError('Unexpected field names found in TransformSpec remove_fields list: "%s". '
-                         'Valid values are "%s".',
-                         ', '.join(removed_fields), ', '.join(schema.fields.keys()))
+        raise ValueError('Unexpected field names found in TransformSpec remove_fields list: "{}". '
+                         'Valid values are "{}".'
+                         .format(', '.join(removed_fields), ', '.join(schema.fields.keys())))
 
     exclude_fields = {f[0] for f in transform_spec.edit_fields} | removed_fields
     fields = [v for k, v in schema.fields.items() if k not in exclude_fields]
