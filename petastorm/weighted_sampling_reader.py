@@ -50,6 +50,9 @@ class WeightedSamplingReader(object):
           normalized.
 
         """
+        if len(readers) <= 1:
+            raise ValueError('Two or more readers must be specified. Got {}.'.format(len(readers)))
+
         if len(readers) != len(probabilities):
             raise ValueError('readers and probabilities are expected to be lists of the same length')
 
@@ -57,6 +60,25 @@ class WeightedSamplingReader(object):
 
         # Normalize probabilities
         self._cum_prob = np.cumsum(np.asarray(probabilities, dtype=np.float) / np.sum(probabilities))
+
+        for other_idx in range(1, len(readers)):
+            if readers[0].batched_output != readers[other_idx].batched_output:
+                raise ValueError('All readers passed to WeightedSamplingReader should have the same value of '
+                                 '"batched_output" attribute')
+
+            if set(readers[0].schema.fields.keys()) != set(readers[other_idx].schema.fields.keys()):
+                raise ValueError('All readers passed to WeightedSamplingReader should have the same schema')
+
+            # If either of ngram attribute is not None, or the ngrams are different, then we can not mix
+            both_have_ngram = (readers[0].ngram is not None) and (readers[other_idx].ngram is not None)
+            ngram_differ = both_have_ngram and readers[0].ngram != readers[other_idx].ngram
+            only_one_have_ngram = (readers[0].ngram is None) != (readers[other_idx].ngram is None)
+            if only_one_have_ngram or ngram_differ:
+                raise ValueError('All readers passed to WeightedSamplingReader should have the same ngram spec')
+
+        self.batched_output = readers[0].batched_output
+        self.ngram = readers[0].ngram
+        self.schema = readers[0].schema
 
     def __len__(self):
         return sum(len(reader) for reader in self._readers)
