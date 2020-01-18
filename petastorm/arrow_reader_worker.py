@@ -23,7 +23,7 @@ from pyarrow import parquet as pq
 from pyarrow.parquet import ParquetFile
 
 from petastorm.cache import NullCache
-from petastorm.compat import compat_piece_read, compat_table_columns_gen, compat_column_num_chunks
+from petastorm.compat import compat_piece_read, compat_table_columns_gen, compat_column_data
 from petastorm.workers_pool import EmptyResultError
 from petastorm.workers_pool.worker_base import WorkerBase
 
@@ -49,7 +49,7 @@ class ArrowReaderWorkerResultsQueueReader(object):
                 # Assume we get only one chunk since reader worker reads one rowgroup at a time
 
                 # `to_pandas` works slower when called on the entire `data` rather directly on a chunk.
-                if compat_column_num_chunks(result_table.column(0)) == 1:
+                if compat_column_data(result_table.column(0)).num_chunks == 1:
                     column_as_pandas = column.data.chunks[0].to_pandas()
                 else:
                     column_as_pandas = column.data.to_pandas()
@@ -156,13 +156,9 @@ class ArrowReaderWorker(WorkerBase):
     def _load_rows(self, pq_file, piece, shuffle_row_drop_range):
         """Loads all rows from a piece"""
 
-        # pyarrow would fail if we request a column names that the dataset is partitioned by, so we strip them from
-        # the `columns` argument.
-        partitions = self._dataset.partitions
         column_names_in_schema = set(field.name for field in self._schema.fields.values())
-        column_names = column_names_in_schema - partitions.partition_names
 
-        result = self._read_with_shuffle_row_drop(piece, pq_file, column_names, shuffle_row_drop_range)
+        result = self._read_with_shuffle_row_drop(piece, pq_file, column_names_in_schema, shuffle_row_drop_range)
 
         if self._transform_spec:
             result_as_pandas = result.to_pandas()
@@ -244,7 +240,19 @@ class ArrowReaderWorker(WorkerBase):
         return pa.Table.from_pandas(result, preserve_index=False)
 
     def _read_with_shuffle_row_drop(self, piece, pq_file, column_names, shuffle_row_drop_partition):
-        table = compat_piece_read(piece, lambda _: pq_file, columns=column_names, partitions=self._dataset.partitions)
+        partition_names = self._dataset.partitions.partition_names
+
+        # pyarrow would fail if we request a column names that the dataset is partitioned by
+        table = compat_piece_read(piece, lambda _: pq_file, columns=column_names - partition_names,
+                                  partitions=self._dataset.partitions)
+
+        # Drop columns we did not explicitly request. This may happen when a table is partitioned. Besides columns
+        # requested, pyarrow will also return partition values. Having these unexpected fields will break some
+        # downstream code.
+        loaded_column_names = set(column[0] for column in compat_table_columns_gen(table))
+        unasked_for_columns = loaded_column_names - column_names
+        if unasked_for_columns:
+            table = table.drop(unasked_for_columns)
 
         num_rows = len(table)
         num_partitions = shuffle_row_drop_partition[1]
