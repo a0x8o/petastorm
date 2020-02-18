@@ -15,9 +15,11 @@ import itertools
 
 import numpy as np
 import pytest
+from pyarrow import parquet as pq
 
 from petastorm import make_batch_reader
 # pylint: disable=unnecessary-lambda
+from petastorm.compat import compat_get_metadata
 from petastorm.tests.test_common import create_test_scalar_dataset
 
 _D = [lambda url, **kwargs: make_batch_reader(url, reader_pool_type='dummy', **kwargs)]
@@ -47,6 +49,15 @@ def _check_simple_reader(reader, expected_data):
         count += len(actual['id'])
 
     assert count == len(expected_data)
+
+
+def _get_bad_field_name(field_list):
+    """ Grab first name from list of valid fields, append random characters to it to get an invalid
+    field name. """
+    bad_field = field_list[0]
+    while bad_field in field_list:
+        bad_field += "VR46"
+    return bad_field
 
 
 @pytest.mark.parametrize('reader_factory', _D + _TP)
@@ -98,3 +109,57 @@ def test_partitioned_field_is_not_queried(reader_factory, tmpdir):
         all_rows = list(reader)
     assert len(data) == len(all_rows)
     assert all_rows[0]._fields == ('string',)
+
+
+@pytest.mark.parametrize('reader_factory', _D)
+def test_asymetric_parquet_pieces(reader_factory, tmpdir):
+    """Check that datasets with parquet files that all rows in datasets that have different number of rowgroups can
+    be fully read """
+    url = 'file://' + tmpdir.strpath
+
+    ROWS_COUNT = 1000
+    # id_div_700 forces asymetric split between partitions and hopefully get us files with different number of row
+    # groups
+    create_test_scalar_dataset(url, ROWS_COUNT, partition_by=['id_div_700'])
+
+    # We verify we have pieces with different number of row-groups
+    dataset = pq.ParquetDataset(tmpdir.strpath)
+    row_group_counts = set(compat_get_metadata(piece, dataset.fs.open).num_row_groups for piece in dataset.pieces)
+    assert len(row_group_counts) > 1
+
+    # Make sure we are not missing any rows.
+    with reader_factory(url, schema_fields=['id']) as reader:
+        row_ids_batched = [row.id for row in reader]
+        actual_row_ids = list(itertools.chain(*row_ids_batched))
+
+    assert ROWS_COUNT == len(actual_row_ids)
+
+
+@pytest.mark.parametrize('reader_factory', _D)
+def test_invalid_column_name(scalar_dataset, reader_factory):
+    """Request a column that doesn't exist. When request only invalid fields,
+    DummyPool returns an EmptyResultError, which then causes a StopIteration in
+    ArrowReaderWorkerResultsQueueReader."""
+    all_fields = list(scalar_dataset.data[0].keys())
+    bad_field = _get_bad_field_name(all_fields)
+    requested_fields = [bad_field]
+
+    with reader_factory(scalar_dataset.url, schema_fields=requested_fields) as reader:
+        with pytest.raises(StopIteration):
+            sample = next(reader)._asdict()
+            assert not sample
+
+
+@pytest.mark.parametrize('reader_factory', _D)
+def test_invalid_and_valid_column_names(scalar_dataset, reader_factory):
+    """Request one column that doesn't exist and one that does. Confirm that only get one field back and
+    that get exception when try to read from invalid field."""
+    all_fields = list(scalar_dataset.data[0].keys())
+    bad_field = _get_bad_field_name(all_fields)
+    requested_fields = [bad_field, all_fields[1]]
+
+    with reader_factory(scalar_dataset.url, schema_fields=requested_fields) as reader:
+        sample = next(reader)._asdict()
+        assert len(sample) == 1
+        with pytest.raises(KeyError):
+            assert sample[bad_field] == ""
