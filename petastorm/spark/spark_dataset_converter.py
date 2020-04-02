@@ -18,16 +18,26 @@ import logging
 import os
 import shutil
 import threading
+import time
 import uuid
-import warnings
 from distutils.version import LooseVersion
+from multiprocessing.pool import ThreadPool
 
+import pyspark
 from pyarrow import LocalFileSystem
 from pyspark.sql.session import SparkSession
+from pyspark.sql.types import ArrayType, DoubleType, FloatType
 from six.moves.urllib.parse import urlparse
 
 from petastorm import make_batch_reader
-from petastorm.fs_utils import FilesystemResolver
+from petastorm.fs_utils import (FilesystemResolver,
+                                get_filesystem_and_path_or_paths)
+
+if LooseVersion(pyspark.__version__) < LooseVersion('3.0'):
+    def vector_to_array(_1, _2='float32'):
+        raise RuntimeError("Vector columns are only supported in pyspark>=3.0")
+else:
+    from pyspark.ml.functions import vector_to_array  # pylint: disable=import-error
 
 DEFAULT_ROW_GROUP_SIZE_BYTES = 32 * 1024 * 1024
 
@@ -113,7 +123,7 @@ def _delete_cache_data_atexit(dataset_url):
     try:
         _delete_cache_data(dataset_url)
     except Exception:  # pylint: disable=broad-except
-        warnings.warn('delete cache data {url} failed.'.format(url=dataset_url))
+        logger.warning('delete cache data %s failed.', dataset_url)
 
 
 def _get_horovod_rank_and_size():
@@ -148,13 +158,11 @@ def _check_rank_and_size_consistent_with_horovod(petastorm_reader_kwargs):
         if cur_shard != hvd_rank or shard_count != hvd_size:
             logger.warning(
                 'The petastorm reader arguments cur_shard(%d) and '
-                'shard_count(%d) '
-                'is not consistent with horovod environments hvd_rank(%d) and '
-                'hvd_size(%d), '
-                'If you want each horovod worker train on one corresponding '
-                'shard data, you should set '
-                'argument `cur_shard` to be `hvd.rank()` and argument '
-                '`shard_count` to be `hvd.size()`.',
+                'shard_count(%d) is not consistent with horovod '
+                'environments hvd_rank(%d) and hvd_size(%d), If you want '
+                'each horovod worker train on one corresponding shard data, '
+                'you should set argument `cur_shard` to be `hvd.rank()` '
+                'and argument `shard_count` to be `hvd.size()`.',
                 cur_shard, shard_count, hvd_rank, hvd_size)
             return False
     return True
@@ -170,15 +178,16 @@ class SparkDatasetConverter(object):
     """
 
     PARENT_CACHE_DIR_URL_CONF = 'petastorm.spark.converter.parentCacheDirUrl'
+    FILE_AVAILABILITY_WAIT_TIMEOUT_SECS_CONF = 'petastorm.spark.converter.fileAvailabilityWaitTimeoutSecs'
 
-    def __init__(self, cache_dir_url, dataset_size):
+    def __init__(self, cache_dir_url, file_urls, dataset_size):
         """
-        :param cache_dir_url: A string denoting the path to store the cache
-            files.
-        :param dataset_size: An int denoting the number of rows in the
-            dataframe.
+        :param cache_dir_url: A string denoting the path to store the cache files.
+        :param file_urls: a list of parquet file url list of this dataset.
+        :param dataset_size: An int denoting the number of rows in the dataframe.
         """
         self.cache_dir_url = cache_dir_url
+        self.file_urls = file_urls
         self.dataset_size = dataset_size
 
     def __len__(self):
@@ -186,6 +195,16 @@ class SparkDatasetConverter(object):
         :return: dataset size
         """
         return self.dataset_size
+
+    @staticmethod
+    def _check_and_set_overriden_petastorm_args(petastorm_reader_kwargs, num_epochs, workers_count):
+        # override some arguments default values of petastorm reader
+        petastorm_reader_kwargs['num_epochs'] = num_epochs
+        if workers_count is None:
+            # TODO: generate a best tuned value for default worker count value
+            workers_count = 4
+        petastorm_reader_kwargs['workers_count'] = workers_count
+        _check_rank_and_size_consistent_with_horovod(petastorm_reader_kwargs)
 
     def make_tf_dataset(
             self,
@@ -222,22 +241,13 @@ class SparkDatasetConverter(object):
                  when exit the returned context manager, the reader
                  will be closed.
         """
-
-        # override some arguments default values of petastorm reader
-        petastorm_reader_kwargs['num_epochs'] = num_epochs
-        if workers_count is None:
-            # TODO: generate a best tuned value for default worker count value
-            workers_count = 4
-        petastorm_reader_kwargs['workers_count'] = workers_count
-
-        _check_rank_and_size_consistent_with_horovod(petastorm_reader_kwargs)
-
+        self._check_and_set_overriden_petastorm_args(
+            petastorm_reader_kwargs, num_epochs=num_epochs, workers_count=workers_count)
         return TFDatasetContextManager(
-            self.cache_dir_url,
+            self.file_urls,
             batch_size=batch_size,
             prefetch=prefetch,
-            petastorm_reader_kwargs=petastorm_reader_kwargs
-        )
+            petastorm_reader_kwargs=petastorm_reader_kwargs)
 
     def make_torch_dataloader(self,
                               batch_size=32,
@@ -266,14 +276,12 @@ class SparkDatasetConverter(object):
                  when exit the returned context manager, the reader
                  will be closed.
         """
-
-        _check_rank_and_size_consistent_with_horovod(petastorm_reader_kwargs)
-
-        return TorchDatasetContextManager(self.cache_dir_url,
-                                          batch_size,
-                                          num_epochs,
-                                          workers_count,
-                                          **petastorm_reader_kwargs)
+        self._check_and_set_overriden_petastorm_args(
+            petastorm_reader_kwargs, num_epochs=num_epochs, workers_count=workers_count)
+        return TorchDatasetContextManager(
+            self.file_urls,
+            batch_size=batch_size,
+            petastorm_reader_kwargs=petastorm_reader_kwargs)
 
     def delete(self):
         """
@@ -290,18 +298,18 @@ class TFDatasetContextManager(object):
 
     def __init__(
             self,
-            data_url,
+            parquet_file_url_list,
             batch_size,
             prefetch,
             petastorm_reader_kwargs
     ):
         """
-        :param data_url: A string specifying the data URL.
+        :param parquet_file_url_list: A string specifying the parquet file URL list.
         :param batch_size: batch size for tensorflow dataset.
         :param prefetch: the prefectch size for tensorflow dataset.
         :param petastorm_reader_kwargs: other arguments for petastorm reader
         """
-        self.data_url = data_url
+        self.parquet_file_url_list = parquet_file_url_list
         self.batch_size = batch_size
         self.prefetch = prefetch
         self.petastorm_reader_kwargs = petastorm_reader_kwargs
@@ -311,8 +319,8 @@ class TFDatasetContextManager(object):
         from petastorm.tf_utils import make_petastorm_dataset
         import tensorflow as tf
 
-        self.reader = make_batch_reader(self.data_url,
-                                        **self.petastorm_reader_kwargs)
+        _wait_file_available(self.parquet_file_url_list)
+        self.reader = make_batch_reader(self.parquet_file_url_list, **self.petastorm_reader_kwargs)
 
         # unroll dataset
         dataset = make_petastorm_dataset(self.reader).flat_map(
@@ -346,24 +354,21 @@ class TorchDatasetContextManager(object):
     :class:`petastorm.Reader`.
     """
 
-    def __init__(self, data_url, batch_size, num_epochs, workers_count,
-                 **petastorm_reader_kwargs):
+    def __init__(self, parquet_file_url_list, batch_size, petastorm_reader_kwargs):
         """
-        :param data_url: A string specifying the data URL.
+        :param parquet_file_url_list: A string specifying the data URL.
         See `SparkDatasetConverter.make_torch_dataloader()` for the definitions
         of the other parameters.
         """
-        petastorm_reader_kwargs["num_epochs"] = num_epochs
-        if workers_count is not None:
-            petastorm_reader_kwargs["workers_count"] = workers_count
-        self.data_url = data_url
+        self.parquet_file_url_list = parquet_file_url_list
         self.batch_size = batch_size
         self.petastorm_reader_kwargs = petastorm_reader_kwargs
 
     def __enter__(self):
         from petastorm.pytorch import DataLoader
 
-        self.reader = make_batch_reader(self.data_url,
+        _wait_file_available(self.parquet_file_url_list)
+        self.reader = make_batch_reader(self.parquet_file_url_list,
                                         **self.petastorm_reader_kwargs)
         self.loader = DataLoader(reader=self.reader, batch_size=self.batch_size)
         return self.loader
@@ -379,7 +384,7 @@ def _get_df_plan(df):
 
 class CachedDataFrameMeta(object):
 
-    def __init__(self, df, row_group_size, compression_codec):
+    def __init__(self, df, row_group_size, compression_codec, dtype):
         self.row_group_size = row_group_size
         self.compression_codec = compression_codec
         # Note: the metadata will hold dataframe plan, but it won't
@@ -388,13 +393,18 @@ class CachedDataFrameMeta(object):
         # This means the dataframe can be released by spark gc.
         self.df_plan = _get_df_plan(df)
         self.cache_dir_url = None
+        self.dtype = dtype
 
     @classmethod
     def create_cached_dataframe(cls, df, parent_cache_dir_url, row_group_size,
-                                compression_codec):
-        meta = cls(df, row_group_size, compression_codec)
+                                compression_codec, dtype):
+        meta = cls(df, row_group_size, compression_codec, dtype)
         meta.cache_dir_url = _materialize_df(
-            df, parent_cache_dir_url, row_group_size, compression_codec)
+            df,
+            parent_cache_dir_url=parent_cache_dir_url,
+            parquet_row_group_size_bytes=row_group_size,
+            compression_codec=compression_codec,
+            dtype=dtype)
         return meta
 
 
@@ -421,7 +431,8 @@ def _make_sub_dir_url(dir_url, name):
 
 def _cache_df_or_retrieve_cache_data_url(df, parent_cache_dir_url,
                                          parquet_row_group_size_bytes,
-                                         compression_codec):
+                                         compression_codec,
+                                         dtype):
     """
     Check whether the df is cached.
     If so, return the existing cache file path.
@@ -432,6 +443,9 @@ def _cache_df_or_retrieve_cache_data_url(df, parent_cache_dir_url,
     :param parquet_row_group_size_bytes: An int denoting the number of bytes
         in a parquet row group.
     :param compression_codec: Specify compression codec.
+    :param dtype: None, 'float32' or 'float64', specifying the precision of the floating-point
+        elements in the output dataset. Integer types will remain unchanged. If None, all types
+        will remain unchanged. Default 'float32'.
     :return: A string denoting the path of the saved parquet file.
     """
     # TODO
@@ -442,14 +456,51 @@ def _cache_df_or_retrieve_cache_data_url(df, parent_cache_dir_url,
         for meta in _cache_df_meta_list:
             if meta.row_group_size == parquet_row_group_size_bytes and \
                     meta.compression_codec == compression_codec and \
-                    meta.df_plan.sameResult(df_plan):
+                    meta.df_plan.sameResult(df_plan) and \
+                    meta.dtype == dtype:
                 return meta.cache_dir_url
         # do not find cached dataframe, start materializing.
         cached_df_meta = CachedDataFrameMeta.create_cached_dataframe(
             df, parent_cache_dir_url, parquet_row_group_size_bytes,
-            compression_codec)
+            compression_codec, dtype)
         _cache_df_meta_list.append(cached_df_meta)
         return cached_df_meta.cache_dir_url
+
+
+def _convert_precision(df, dtype):
+    if dtype is None:
+        return df
+
+    if dtype != "float32" and dtype != "float64":
+        raise ValueError("dtype {} is not supported. \
+            Use 'float32' or float64".format(dtype))
+
+    source_type, target_type = (DoubleType, FloatType) \
+        if dtype == "float32" else (FloatType, DoubleType)
+
+    logger.warning("Converting floating-point columns to %s", dtype)
+
+    for field in df.schema:
+        col_name = field.name
+        if isinstance(field.dataType, source_type):
+            df = df.withColumn(col_name, df[col_name].cast(target_type()))
+        elif isinstance(field.dataType, ArrayType) and \
+                isinstance(field.dataType.elementType, source_type):
+            df = df.withColumn(col_name, df[col_name].cast(ArrayType(target_type())))
+    return df
+
+
+def _convert_vector(df, dtype):
+    from pyspark.ml.linalg import VectorUDT
+    from pyspark.mllib.linalg import VectorUDT as OldVectorUDT
+
+    for field in df.schema:
+        col_name = field.name
+        if isinstance(field.dataType, VectorUDT) or \
+                isinstance(field.dataType, OldVectorUDT):
+            df = df.withColumn(col_name,
+                               vector_to_array(df[col_name], dtype))
+    return df
 
 
 def _gen_cache_dir_name():
@@ -467,9 +518,11 @@ def _gen_cache_dir_name():
 
 
 def _materialize_df(df, parent_cache_dir_url, parquet_row_group_size_bytes,
-                    compression_codec):
+                    compression_codec, dtype):
     dir_name = _gen_cache_dir_name()
     save_to_dir_url = _make_sub_dir_url(parent_cache_dir_url, dir_name)
+    df = _convert_vector(df, dtype)
+    df = _convert_precision(df, dtype)
 
     df.write \
         .option("compression", compression_codec) \
@@ -483,10 +536,47 @@ def _materialize_df(df, parent_cache_dir_url, parquet_row_group_size_bytes,
     return save_to_dir_url
 
 
+def _wait_file_available(url_list):
+    """
+    Waiting about SparkDatasetConverter.FILE_AVAILABILITY_WAIT_TIMEOUT_SECS_CONF seconds to make sure
+    all files are available for reading. This is useful in some filesystems, such as S3 which only
+    providing eventually consistency.
+    """
+    fs, path_list = get_filesystem_and_path_or_paths(url_list)
+    wait_seconds = _get_spark_session().conf \
+        .get(SparkDatasetConverter.FILE_AVAILABILITY_WAIT_TIMEOUT_SECS_CONF, '30')
+    wait_seconds = int(wait_seconds)
+    if wait_seconds <= 0:
+        return
+    logger.debug('Waiting some seconds until all parquet-store files appear at urls %s', ','.join(url_list))
+
+    def wait_for_file(path):
+        end_time = time.time() + wait_seconds
+        while time.time() < end_time:
+            if fs.exists(path):
+                return True
+            time.sleep(0.1)
+        return False
+
+    pool = ThreadPool(64)
+    try:
+        results = pool.map(wait_for_file, path_list)
+        failed_list = [url for url, result in zip(url_list, results) if not result]
+        if failed_list:
+            raise RuntimeError('Timeout while waiting for all parquet-store files to appear at urls {failed_list},'
+                               'Please check whether these files were saved successfully when materializing dataframe.'
+                               .format(failed_list=','.join(failed_list)))
+    finally:
+        pool.close()
+        pool.join()
+
+
 def make_spark_converter(
         df,
         parquet_row_group_size_bytes=DEFAULT_ROW_GROUP_SIZE_BYTES,
-        compression_codec=None):
+        compression_codec=None,
+        dtype='float32'
+):
     """
     Convert a spark dataframe into a :class:`SparkDatasetConverter` object.
     It will materialize a spark dataframe to the directory specified by
@@ -509,6 +599,9 @@ def make_spark_converter(
     :param compression_codec: Specify compression codec.
         It can be one of 'uncompressed', 'bzip2', 'gzip', 'lz4', 'snappy', 'deflate'.
         Default None. If None, it will leave the data uncompressed.
+    :param dtype: None, 'float32' or 'float64', specifying the precision of the floating-point
+        elements in the output dataset. Integer types will remain unchanged. If None, all types
+        will remain unchanged. Default 'float32'.
 
     :return: a :class:`SparkDatasetConverter` object that holds the
         materialized dataframe and can be used to make one or more tensorflow
@@ -527,10 +620,15 @@ def make_spark_converter(
             "'uncompressed', 'bzip2', 'gzip', 'lz4', 'snappy', 'deflate'")
 
     dataset_cache_dir_url = _cache_df_or_retrieve_cache_data_url(
-        df, parent_cache_dir_url, parquet_row_group_size_bytes, compression_codec)
+        df, parent_cache_dir_url, parquet_row_group_size_bytes, compression_codec, dtype)
 
     # TODO: improve this by read parquet file metadata to get count
     #  Currently spark can make sure to only read the minimal column
     #  so count will usually be fast.
-    dataset_size = _get_spark_session().read.parquet(dataset_cache_dir_url).count()
-    return SparkDatasetConverter(dataset_cache_dir_url, dataset_size)
+    spark = _get_spark_session()
+    spark_df = spark.read.parquet(dataset_cache_dir_url)
+
+    dataset_size = spark_df.count()
+    parquet_file_url_list = list(spark_df._jdf.inputFiles())
+
+    return SparkDatasetConverter(dataset_cache_dir_url, parquet_file_url_list, dataset_size)

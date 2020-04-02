@@ -16,14 +16,19 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+from distutils.version import LooseVersion
 
 import numpy as np
+import pyspark
 import pytest
 import tensorflow as tf
 from pyspark.sql import SparkSession
-from pyspark.sql.types import (BinaryType, BooleanType, ByteType, DoubleType,
-                               FloatType, IntegerType, LongType, ShortType,
-                               StringType, StructField, StructType)
+from pyspark.sql.functions import pandas_udf
+from pyspark.sql.types import (ArrayType, BinaryType, BooleanType, ByteType,
+                               DoubleType, FloatType, IntegerType, LongType,
+                               ShortType, StringType, StructField, StructType)
 from six.moves.urllib.parse import urlparse
 
 from petastorm import make_batch_reader
@@ -31,9 +36,9 @@ from petastorm.fs_utils import FilesystemResolver
 from petastorm.spark import (SparkDatasetConverter, make_spark_converter,
                              spark_dataset_converter)
 from petastorm.spark.spark_dataset_converter import (
-    _check_url, _get_horovod_rank_and_size, _get_parent_cache_dir_url,
-    _check_rank_and_size_consistent_with_horovod, _make_sub_dir_url,
-    register_delete_dir_handler)
+    _check_rank_and_size_consistent_with_horovod, _check_url,
+    _get_horovod_rank_and_size, _get_parent_cache_dir_url, _make_sub_dir_url,
+    _wait_file_available, register_delete_dir_handler)
 
 try:
     from mock import mock
@@ -51,6 +56,7 @@ class TestContext(object):
         self.tempdir = tempfile.mkdtemp('_spark_converter_test')
         self.temp_url = 'file://' + self.tempdir.replace(os.sep, '/')
         self.spark.conf.set(SparkDatasetConverter.PARENT_CACHE_DIR_URL_CONF, self.temp_url)
+        self.spark.conf.set(SparkDatasetConverter.FILE_AVAILABILITY_WAIT_TIMEOUT_SECS_CONF, '2')
 
     def tear_down(self):
         self.spark.stop()
@@ -102,18 +108,38 @@ def test_primitive(test_ctx):
                     actual_ele = actual_ele.decode()
                 if col == "bin_col":
                     actual_ele = bytearray(actual_ele)
-                assert expected_ele == actual_ele
+                if col == "float_col" or col == "double_col":
+                    # Note that the default dtype is float32
+                    assert pytest.approx(expected_ele, rel=1e-6) == actual_ele
+                else:
+                    assert expected_ele == actual_ele
 
         assert len(expected_df) == len(converter)
 
     assert np.bool_ == ts.bool_col.dtype.type
     assert np.float32 == ts.float_col.dtype.type
-    assert np.float64 == ts.double_col.dtype.type
+    # Default dtype float32
+    assert np.float32 == ts.double_col.dtype.type
     assert np.int16 == ts.short_col.dtype.type
     assert np.int32 == ts.int_col.dtype.type
     assert np.int64 == ts.long_col.dtype.type
     assert np.object_ == ts.str_col.dtype.type
     assert np.object_ == ts.bin_col.dtype.type
+
+
+def test_array_field(test_ctx):
+    @pandas_udf('array<float>')
+    def gen_array(v):
+        return v.map(lambda x: np.random.rand(10))
+    df1 = test_ctx.spark.range(10).withColumn('v', gen_array('id')).repartition(2)
+    cv1 = make_spark_converter(df1)
+    # we can auto infer one-dim array shape
+    with cv1.make_tf_dataset(batch_size=4, num_epochs=1) as dataset:
+        tf_iter = dataset.make_one_shot_iterator()
+        next_op = tf_iter.get_next()
+        with tf.Session() as sess:
+            batch1 = sess.run(next_op)
+        assert batch1.v.shape == (4, 10)
 
 
 def test_delete(test_ctx):
@@ -305,6 +331,87 @@ def test_horovod_rank_compatibility(test_ctx):
             petastorm_reader_kwargs={"cur_shard": 1, "shard_count": 3})
 
 
+def test_dtype(test_ctx):
+    df = test_ctx.spark.range(10)
+    df = df.withColumn("float_col", df.id.cast(FloatType())) \
+        .withColumn("double_col", df.id.cast(DoubleType()))
+
+    converter1 = make_spark_converter(df)
+    with converter1.make_tf_dataset() as dataset:
+        iterator = dataset.make_one_shot_iterator()
+        tensor = iterator.get_next()
+        with tf.Session() as sess:
+            ts = sess.run(tensor)
+    assert np.float32 == ts.double_col.dtype.type
+
+    converter2 = make_spark_converter(df, dtype='float64')
+    with converter2.make_tf_dataset() as dataset:
+        iterator = dataset.make_one_shot_iterator()
+        tensor = iterator.get_next()
+        with tf.Session() as sess:
+            ts = sess.run(tensor)
+    assert np.float64 == ts.float_col.dtype.type
+
+    converter3 = make_spark_converter(df, dtype=None)
+    with converter3.make_tf_dataset() as dataset:
+        iterator = dataset.make_one_shot_iterator()
+        tensor = iterator.get_next()
+        with tf.Session() as sess:
+            ts = sess.run(tensor)
+    assert np.float32 == ts.float_col.dtype.type
+    assert np.float64 == ts.double_col.dtype.type
+
+    with pytest.raises(ValueError, match="dtype float16 is not supported. \
+            Use 'float32' or float64"):
+        make_spark_converter(df, dtype="float16")
+
+
+def test_array(test_ctx):
+    df = test_ctx.spark.createDataFrame(
+        [([1., 2., 3.],),
+         ([4., 5., 6.],)],
+        StructType([
+            StructField(name='c1', dataType=ArrayType(DoubleType()))
+        ])
+    )
+    converter1 = make_spark_converter(df)
+    with converter1.make_tf_dataset() as dataset:
+        iterator = dataset.make_one_shot_iterator()
+        tensor = iterator.get_next()
+        with tf.Session() as sess:
+            ts = sess.run(tensor)
+    assert np.float32 == ts.c1.dtype.type
+
+
+@pytest.mark.skipif(
+    LooseVersion(pyspark.__version__) < LooseVersion("3.0"),
+    reason="Vector columns are not supported for pyspark {} < 3.0.0"
+    .format(pyspark.__version__))
+def test_vector_to_array(test_ctx):
+    from pyspark.ml.linalg import Vectors
+    from pyspark.mllib.linalg import Vectors as OldVectors
+    df = test_ctx.spark.createDataFrame([
+        (Vectors.dense(1.0, 2.0, 3.0), OldVectors.dense(10.0, 20.0, 30.0)),
+        (Vectors.dense(5.0, 6.0, 7.0), OldVectors.dense(50.0, 60.0, 70.0))],
+                                        ["vec", "oldVec"])
+    converter1 = make_spark_converter(df)
+    with converter1.make_tf_dataset(num_epochs=1) as dataset:
+        iterator = dataset.make_one_shot_iterator()
+        tensor = iterator.get_next()
+        with tf.Session() as sess:
+            ts = sess.run(tensor)
+    assert np.float32 == ts.vec.dtype.type
+    assert np.float32 == ts.oldVec.dtype.type
+    vec_col = ts.vec[ts.vec[:, 0].argsort()]
+    old_vec_col = ts.oldVec[ts.oldVec[:, 0].argsort()]
+    assert (2, 3) == ts.vec.shape
+    assert (2, 3) == ts.oldVec.shape
+    assert ([1., 2., 3.] == vec_col[0]).all() and \
+           ([5., 6., 7.] == vec_col[1]).all()
+    assert ([10., 20., 30.] == old_vec_col[0]).all() and \
+           ([50., 60., 70] == old_vec_col[1]).all()
+
+
 def test_torch_primitive(test_ctx):
     import torch
 
@@ -333,7 +440,11 @@ def test_torch_primitive(test_ctx):
             for col in df.schema.names:
                 actual_ele = batch[col][0]
                 expected_ele = expected_df[i][col]
-                assert expected_ele == actual_ele
+                if col == "float_col" or col == "double_col":
+                    # Note that the default dtype is float32
+                    assert pytest.approx(expected_ele, rel=1e-6) == actual_ele
+                else:
+                    assert expected_ele == actual_ele
 
         assert len(expected_df) == len(converter)
     assert torch.uint8 == batch["bool_col"].dtype
@@ -411,15 +522,50 @@ def test_torch_dataloader_advanced_params(mock_torch_make_batch_reader, test_ctx
     with conv.make_torch_dataloader(reader_pool_type='dummy', cur_shard=1,
                                     shard_count=SHARD_COUNT) as _:
         pass
-    peta_args = mock_torch_make_batch_reader.call_args[1]
+    peta_args = mock_torch_make_batch_reader.call_args.kwargs
     assert peta_args['reader_pool_type'] == 'dummy' and \
         peta_args['cur_shard'] == 1 and \
         peta_args['shard_count'] == SHARD_COUNT and \
         peta_args['num_epochs'] is None and \
-        ('workers_count' not in peta_args)
+        peta_args['workers_count'] == 4
 
     # Test default value overridden arguments.
     with conv.make_torch_dataloader(num_epochs=1, workers_count=2) as _:
         pass
     peta_args = mock_torch_make_batch_reader.call_args[1]
     assert peta_args['num_epochs'] == 1 and peta_args['workers_count'] == 2
+
+
+def test_wait_file_available(test_ctx):
+    pq_dir = os.path.join(test_ctx.tempdir, 'test_ev')
+    os.makedirs(pq_dir)
+    file1_path = os.path.join(pq_dir, 'file1')
+    file2_path = os.path.join(pq_dir, 'file2')
+    url1 = 'file://' + file1_path.replace(os.sep, '/')
+    url2 = 'file://' + file2_path.replace(os.sep, '/')
+
+    url_list = [url1, url2]
+
+    def create_file(p):
+        with open(p, 'w'):
+            pass
+
+    # 1. test all files exists.
+    create_file(file1_path)
+    create_file(file2_path)
+    _wait_file_available(url_list)
+
+    # 2. test one file does not exists. Raise error.
+    os.remove(file2_path)
+    with pytest.raises(RuntimeError,
+                       match='Timeout while waiting for all parquet-store files to appear at urls'):
+        _wait_file_available(url_list)
+
+    # 3. test one file accessible after 1 second.
+    def delay_create_file2():
+        time.sleep(1)
+        create_file(file2_path)
+
+    threading.Thread(target=delay_create_file2()).start()
+
+    _wait_file_available(url_list)
