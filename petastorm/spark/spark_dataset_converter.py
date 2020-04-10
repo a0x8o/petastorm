@@ -45,6 +45,13 @@ logger = logging.getLogger(__name__)
 
 
 def _get_spark_session():
+    """
+    Get or create spark session.
+    Note: This function can only be invoked from driver side.
+    """
+    if pyspark.TaskContext.get() is not None:
+        # This is a safety check.
+        raise RuntimeError('_get_spark_session should not be invoked from executor side.')
     return SparkSession.builder.getOrCreate()
 
 
@@ -106,18 +113,11 @@ def register_delete_dir_handler(handler):
         _delete_dir_handler = handler
 
 
-def _delete_cache_data(dataset_url):
-    """
-    Delete the cache data in the underlying file system.
-    """
-    _delete_dir_handler(dataset_url)
-
-
 def _delete_cache_data_atexit(dataset_url):
     try:
-        _delete_cache_data(dataset_url)
-    except Exception:  # pylint: disable=broad-except
-        logger.warning('delete cache data %s failed.', dataset_url)
+        _delete_dir_handler(dataset_url)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning('Delete cache data %s failed due to %s', dataset_url, repr(e))
 
 
 def _get_horovod_rank_and_size():
@@ -172,7 +172,6 @@ class SparkDatasetConverter(object):
     """
 
     PARENT_CACHE_DIR_URL_CONF = 'petastorm.spark.converter.parentCacheDirUrl'
-    FILE_AVAILABILITY_WAIT_TIMEOUT_SECS_CONF = 'petastorm.spark.converter.fileAvailabilityWaitTimeoutSecs'
 
     def __init__(self, cache_dir_url, file_urls, dataset_size):
         """
@@ -281,7 +280,7 @@ class SparkDatasetConverter(object):
         """
         Delete cache files at self.cache_dir_url.
         """
-        _delete_cache_data(self.cache_dir_url)
+        _remove_cache_metadata_and_data(self.cache_dir_url)
 
 
 class TFDatasetContextManager(object):
@@ -390,8 +389,8 @@ class CachedDataFrameMeta(object):
         self.dtype = dtype
 
     @classmethod
-    def create_cached_dataframe(cls, df, parent_cache_dir_url, row_group_size,
-                                compression_codec, dtype):
+    def create_cached_dataframe_meta(cls, df, parent_cache_dir_url, row_group_size,
+                                     compression_codec, dtype):
         meta = cls(df, row_group_size, compression_codec, dtype)
         meta.cache_dir_url = _materialize_df(
             df,
@@ -475,11 +474,20 @@ def _cache_df_or_retrieve_cache_data_url(df, parent_cache_dir_url,
                     meta.dtype == dtype:
                 return meta.cache_dir_url
         # do not find cached dataframe, start materializing.
-        cached_df_meta = CachedDataFrameMeta.create_cached_dataframe(
+        cached_df_meta = CachedDataFrameMeta.create_cached_dataframe_meta(
             df, parent_cache_dir_url, parquet_row_group_size_bytes,
             compression_codec, dtype)
         _cache_df_meta_list.append(cached_df_meta)
         return cached_df_meta.cache_dir_url
+
+
+def _remove_cache_metadata_and_data(cache_dir_url):
+    with _cache_df_meta_list_lock:
+        for i in range(len(_cache_df_meta_list)):
+            if _cache_df_meta_list[i].cache_dir_url == cache_dir_url:
+                _cache_df_meta_list.pop(i)
+                break
+    _delete_dir_handler(cache_dir_url)
 
 
 def _convert_precision(df, dtype):
@@ -551,22 +559,20 @@ def _materialize_df(df, parent_cache_dir_url, parquet_row_group_size_bytes,
     return save_to_dir_url
 
 
+_FILE_AVAILABILITY_WAIT_TIMEOUT_SECS = 30
+
+
 def _wait_file_available(url_list):
     """
-    Waiting about SparkDatasetConverter.FILE_AVAILABILITY_WAIT_TIMEOUT_SECS_CONF seconds to make sure
+    Waiting about _FILE_AVAILABILITY_WAIT_TIMEOUT_SECS seconds (default 30 seconds) to make sure
     all files are available for reading. This is useful in some filesystems, such as S3 which only
     providing eventually consistency.
     """
     fs, path_list = get_filesystem_and_path_or_paths(url_list)
-    wait_seconds = _get_spark_session().conf \
-        .get(SparkDatasetConverter.FILE_AVAILABILITY_WAIT_TIMEOUT_SECS_CONF, '30')
-    wait_seconds = int(wait_seconds)
-    if wait_seconds <= 0:
-        return
     logger.debug('Waiting some seconds until all parquet-store files appear at urls %s', ','.join(url_list))
 
     def wait_for_file(path):
-        end_time = time.time() + wait_seconds
+        end_time = time.time() + _FILE_AVAILABILITY_WAIT_TIMEOUT_SECS
         while time.time() < end_time:
             if fs.exists(path):
                 return True
@@ -588,18 +594,21 @@ def _wait_file_available(url_list):
 
 def _check_dataset_file_median_size(url_list):
     fs, path_list = get_filesystem_and_path_or_paths(url_list)
+    RECOMMENDED_FILE_SIZE_BYTES = 50 * 1024 * 1024
 
     # TODO: also check file size for other file system.
     if isinstance(fs, LocalFileSystem):
         pool = ThreadPool(64)
         try:
             file_size_list = pool.map(os.path.getsize, path_list)
-            mid_index = len(file_size_list) // 2
-            median_size = sorted(file_size_list)[mid_index]
-            if median_size < 50 * 1024 * 1024:
-                logger.warning('The median size (%d) of these parquet files (%s) is too small.'
-                               'Increase file sizes by repartition or coalesce spark dataframe, which '
-                               'will help improve performance.', median_size, ','.join(url_list))
+            if len(file_size_list) > 1:
+                mid_index = len(file_size_list) // 2
+                median_size = sorted(file_size_list, reverse=True)[mid_index]  # take the larger one if tie
+                if median_size < RECOMMENDED_FILE_SIZE_BYTES:
+                    logger.warning('The median size %d B (< 50 MB) of the parquet files is too small. '
+                                   'Total size: %d B. Increase the median file size by calling df.repartition(n) or '
+                                   'df.coalesce(n), which might help improve the performance. Parquet files: %s, ...',
+                                   median_size, sum(file_size_list), url_list[0])
         finally:
             pool.close()
             pool.join()

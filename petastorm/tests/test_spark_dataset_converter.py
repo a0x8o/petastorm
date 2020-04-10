@@ -23,6 +23,7 @@ from distutils.version import LooseVersion
 import numpy as np
 import pyspark
 import pytest
+import py4j
 import tensorflow as tf
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import pandas_udf
@@ -38,8 +39,8 @@ from petastorm.spark import (SparkDatasetConverter, make_spark_converter,
 from petastorm.spark.spark_dataset_converter import (
     _check_dataset_file_median_size, _check_parent_cache_dir_url,
     _check_rank_and_size_consistent_with_horovod, _check_url,
-    _get_horovod_rank_and_size, _make_sub_dir_url,
-    _wait_file_available, register_delete_dir_handler)
+    _get_horovod_rank_and_size, _get_spark_session, _make_sub_dir_url,
+    register_delete_dir_handler, _wait_file_available)
 
 try:
     from mock import mock
@@ -56,9 +57,11 @@ class TestContext(object):
         self.tempdir = tempfile.mkdtemp('_spark_converter_test')
         self.temp_url = 'file://' + self.tempdir.replace(os.sep, '/')
         self.spark.conf.set(SparkDatasetConverter.PARENT_CACHE_DIR_URL_CONF, self.temp_url)
-        self.spark.conf.set(SparkDatasetConverter.FILE_AVAILABILITY_WAIT_TIMEOUT_SECS_CONF, '2')
+        spark_dataset_converter._FILE_AVAILABILITY_WAIT_TIMEOUT_SECS = 2
 
     def tear_down(self):
+        # restore default file availability wait timeout
+        spark_dataset_converter._FILE_AVAILABILITY_WAIT_TIMEOUT_SECS = 30
         self.spark.stop()
 
 
@@ -232,6 +235,20 @@ def test_df_caching(test_ctx):
     converter12 = make_spark_converter(df1, compression_codec=None)
     converter22 = make_spark_converter(df1, compression_codec="snappy")
     assert converter12.cache_dir_url != converter22.cache_dir_url
+
+
+def test_df_delete_caching_meta(test_ctx):
+    from petastorm.spark.spark_dataset_converter import _cache_df_meta_list
+    df1 = test_ctx.spark.range(10)
+    df2 = test_ctx.spark.range(20)
+    converter1 = make_spark_converter(df1)
+    converter2 = make_spark_converter(df2)
+    converter1.delete()
+    cached_list = set(map(lambda x: x.cache_dir_url, _cache_df_meta_list))
+    assert converter1.cache_dir_url not in cached_list
+    assert converter2.cache_dir_url in cached_list
+    # test recreate converter1 after delete should work.
+    make_spark_converter(df1)
 
 
 def test_check_url():
@@ -559,10 +576,10 @@ def test_wait_file_available(test_ctx):
 
 def test_check_dataset_file_median_size(test_ctx, caplog):
     file_size_map = {
-        '/a/b/01.parquet': 50,
-        '/a/b/02.parquet': 70,
-        '/a/b/03.parquet': 60,
-        '/a/b/04.parquet': 65,
+        '/a/b/01.parquet': 30,
+        '/a/b/02.parquet': 40,
+        '/a/b/03.parquet': 50,
+        '/a/b/04.parquet': 60,
         '/a/b/05.parquet': 999000,
     }
     with mock.patch('os.path.getsize') as mock_path_get_size:
@@ -570,12 +587,19 @@ def test_check_dataset_file_median_size(test_ctx, caplog):
         url_list = ['file://' + path for path in file_size_map.keys()]
         caplog.clear()
         _check_dataset_file_median_size(url_list)
-        assert 'The median size (65) of these parquet files' in '\n'.join([r.message for r in caplog.records])
+        assert 'The median size' in " ".join(caplog.messages)
+
         for k in file_size_map:
             file_size_map[k] *= (1024 * 1024)
         caplog.clear()
         _check_dataset_file_median_size(url_list)
-        assert 'The median size (68157440) of these parquet files' not in '\n'.join([r.message for r in caplog.records])
+        assert 'The median size' not in " ".join(caplog.messages)
+
+        file_size_map = {'/a/b/01.parquet': 29}
+        url_list = ['file:///a/b/01.parquet']
+        caplog.clear()
+        _check_dataset_file_median_size(url_list)
+        assert 'The median size' not in " ".join(caplog.messages)
 
 
 @mock.patch.dict(os.environ, {'DATABRICKS_RUNTIME_VERSION': '7.0'}, clear=True)
@@ -597,3 +621,12 @@ def test_check_parent_cache_dir_url(test_ctx, caplog):
         caplog.clear()
         _check_parent_cache_dir_url('file:/a/b')
         assert not log_warning_occur()
+
+
+def test_get_spark_session_safe_check(test_ctx):
+    def map_fn(_):
+        _get_spark_session()
+        return 0
+
+    with pytest.raises(py4j.protocol.Py4JJavaError):
+        test_ctx.spark.sparkContext.parallelize(range(1), 1).map(map_fn).collect()
